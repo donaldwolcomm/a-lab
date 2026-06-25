@@ -52,10 +52,10 @@ metadata:
 
  core:
    default-sampling-rate: 1
-```
+
 Need to ensure that the interface description on the router matches the regex in the outlet.yaml file. eg `transit : ISP`
 
-
+#SNMPv3
 ---
 metadata:
   providers:
@@ -67,4 +67,5 @@ metadata:
           authentication-passphrase: "pass"
           privacy-protocol: AES
           privacy-passphrase: "pass"
-          
+```
+
