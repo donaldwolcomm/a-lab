@@ -1,0 +1,395 @@
+---
+# =============================================================================
+# Akvorado Lab — Docker Compose
+# =============================================================================
+# This compose file is pre-configured for the lab with:
+#   - All core Akvorado services (inlet, outlet, orchestrator, console)
+#   - Kafka (KRaft mode, no Zookeeper)
+#   - Kafka UI (browseable at http://VM-IP:8081/kafka-ui)
+#   - ClickHouse
+#   - Redis
+#   - Traefik reverse proxy with Let's Encrypt TLS and basic auth
+#
+# BEFORE STARTING — complete these steps:
+#
+#   1. Set your domain name (search for: flows.example.com)
+#   2. Set your email address for Let's Encrypt (search for: email@example.com)
+#   3. Generate a bcrypt password hash and paste it in the basic-auth label:
+#        sudo apt-get install -y apache2-utils
+#        htpasswd -nbB flows yourpassword
+#      Then escape every $ as $$ before pasting into the label below.
+#   4. Update the Remote-User/Name/Email headers in akvorado-console to
+#      match the username you chose above.
+#
+# PORT SUMMARY:
+#   80   → HTTP (redirects to HTTPS)
+#   443  → HTTPS (Akvorado console, public)
+#   8080 → Private/internal services (loopback only — do not expose)
+#   8081 → HTTP public entrypoint (redirect only)
+#   2055 → NetFlow v9 UDP (MikroTik)
+#   4739 → IPFIX UDP
+#   6343 → sFlow UDP (Arista)
+#   10179→ Outlet TCP
+# =============================================================================
+
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 247.16.14.0/24
+        - subnet: fd1c:8ce3:6fb:1::/64
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-akvorado
+
+volumes:
+  akvorado-kafka:
+  akvorado-geoip:
+  akvorado-clickhouse:
+  akvorado-run:
+  akvorado-console-db:
+  akvorado-letsencrypt:      # Stores Let's Encrypt certificates across restarts
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode — no Zookeeper required)
+  # ---------------------------------------------------------------------------
+  kafka:
+    extends:
+      file: versions.yml
+      service: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CLIENT://:9092,CONTROLLER://:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CLIENT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: CLIENT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: CLIENT
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    restart: unless-stopped
+    volumes:
+      - akvorado-kafka:/var/lib/kafka/data
+    healthcheck:
+      interval: 20s
+      test: ["CMD",
+             "/opt/kafka/bin/kafka-topics.sh", "--list", "--bootstrap-server", "kafka:9092"]
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI — accessible at https://flows.example.com/kafka-ui (read-only)
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    extends:
+      file: versions.yml
+      service: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_READONLY: true
+      SERVER_SERVLET_CONTEXT_PATH: /kafka-ui
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kafka-ui.rule=PathPrefix(`/kafka-ui`)
+
+  # ---------------------------------------------------------------------------
+  # Redis — used by the console for session/cache storage
+  # ---------------------------------------------------------------------------
+  redis:
+    extends:
+      file: versions.yml
+      service: redis
+    restart: unless-stopped
+    healthcheck:
+      interval: 20s
+      test:
+        - CMD-SHELL
+        - "timeout 3 redis-cli ping | grep -q PONG"
+
+  # ---------------------------------------------------------------------------
+  # Akvorado Orchestrator — coordinates all Akvorado components
+  # Reads from: ../config/akvorado.yaml (mounted read-only)
+  # To apply config changes: docker compose restart akvorado-orchestrator
+  # ---------------------------------------------------------------------------
+  akvorado-orchestrator:
+    extends:
+      file: versions.yml
+      service: akvorado
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: orchestrator /etc/akvorado/akvorado.yaml
+    volumes:
+      - ../config:/etc/akvorado:ro
+      - akvorado-geoip:/usr/share/GeoIP:ro
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.akvorado-orchestrator-metrics.rule=PathPrefix(`/api/v0/orchestrator/metrics`)
+      - traefik.http.routers.akvorado-orchestrator-metrics.service=akvorado-orchestrator
+      - traefik.http.routers.akvorado-orchestrator-metrics.observability.accesslogs=false
+      - traefik.http.routers.akvorado-orchestrator.entrypoints=private
+      - traefik.http.routers.akvorado-orchestrator.rule=PathPrefix(`/api/v0/orchestrator`)
+      - traefik.http.services.akvorado-orchestrator.loadbalancer.server.port=8080
+      - metrics.enable=true
+      - metrics.path=/api/v0/metrics
+
+  # ---------------------------------------------------------------------------
+  # Akvorado Console — the web UI
+  # Accessible at: https://flows.example.com  (after TLS is configured)
+  # To apply config changes: docker compose restart akvorado-console
+  #
+  # NOTE: Update the Remote-User/Name/Email values below to match the
+  # username you created with htpasswd in the setup steps above.
+  # ---------------------------------------------------------------------------
+  akvorado-console:
+    extends:
+      file: versions.yml
+      service: akvorado
+    restart: unless-stopped
+    depends_on:
+      akvorado-orchestrator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: console http://akvorado-orchestrator:8080
+    volumes:
+      - akvorado-console-db:/run/akvorado
+    environment:
+      AKVORADO_CFG_CONSOLE_DATABASE_DSN: /run/akvorado/console.sqlite
+      AKVORADO_CFG_CONSOLE_BRANDING: ${AKVORADO_CFG_CONSOLE_BRANDING-false}
+    healthcheck:
+      disable: ${CONSOLE_HEALTHCHECK_DISABLED-false}
+    labels:
+      - traefik.enable=true
+      # --- TLS / Let's Encrypt ---
+      - traefik.http.routers.akvorado-console.tls=true
+      - traefik.http.routers.akvorado-console.tls.certresolver=letsencrypt
+      - traefik.http.routers.akvorado-console.tls.domains[0].main=flows.example.com   # <-- YOUR DOMAIN
+      - traefik.http.routers.akvorado-console.entrypoints=websecure
+      # --- Private debug endpoint ---
+      - traefik.http.routers.akvorado-console-debug.rule=PathPrefix(`/debug`)
+      - traefik.http.routers.akvorado-console-debug.entrypoints=private
+      - traefik.http.routers.akvorado-console-debug.service=akvorado-console
+      # --- Suppress metrics access logging ---
+      - traefik.http.routers.akvorado-console-metrics.rule=PathPrefix(`/api/v0/console/metrics`)
+      - traefik.http.routers.akvorado-console-metrics.service=akvorado-console
+      - traefik.http.routers.akvorado-console-metrics.observability.accesslogs=false
+      # --- Main console router ---
+      - "traefik.http.routers.akvorado-console.rule=!PathPrefix(`/debug`)"
+      - traefik.http.routers.akvorado-console.priority=1
+      - traefik.http.routers.akvorado-console.middlewares=console-auth
+      - traefik.http.services.akvorado-console.loadbalancer.server.port=8080
+      # --- User identity headers (update to match your htpasswd username) ---
+      - traefik.http.middlewares.console-auth.headers.customrequestheaders.Remote-User=flows
+      - traefik.http.middlewares.console-auth.headers.customrequestheaders.Remote-Name=Flows Admin
+      - traefik.http.middlewares.console-auth.headers.customrequestheaders.Remote-Email=admin@example.com
+      - metrics.enable=true
+      - metrics.path=/api/v0/metrics
+
+  # ---------------------------------------------------------------------------
+  # Akvorado Inlet — receives flow data from network devices
+  # Listens on:
+  #   UDP 2055 — NetFlow v9 (MikroTik)
+  #   UDP 4739 — IPFIX
+  #   UDP 6343 — sFlow (Arista)
+  # To apply config changes: docker compose restart akvorado-inlet
+  # ---------------------------------------------------------------------------
+  akvorado-inlet:
+    extends:
+      file: versions.yml
+      service: akvorado
+    ports:
+      - 2055:2055/udp
+      - 4739:4739/udp
+      - 6343:6343/udp
+    restart: unless-stopped
+    depends_on:
+      akvorado-orchestrator:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    command: inlet http://akvorado-orchestrator:8080
+    volumes:
+      - akvorado-run:/run/akvorado
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.akvorado-inlet-metrics.rule=PathPrefix(`/api/v0/inlet/metrics`)
+      - traefik.http.routers.akvorado-inlet-metrics.service=akvorado-inlet
+      - traefik.http.routers.akvorado-inlet-metrics.observability.accesslogs=false
+      - traefik.http.routers.akvorado-inlet.entrypoints=private
+      - traefik.http.routers.akvorado-inlet.rule=PathPrefix(`/api/v0/inlet`)
+      - traefik.http.services.akvorado-inlet.loadbalancer.server.port=8080
+      - metrics.enable=true
+      - metrics.port=8080
+      - metrics.path=/api/v0/metrics
+
+  # ---------------------------------------------------------------------------
+  # Akvorado Outlet — exports enriched flow data (e.g. to external consumers)
+  # To apply config changes: docker compose restart akvorado-outlet
+  #
+  # NOTE: If using MikroTik ROS7 with NetFlow v9, add the following to
+  # config/outlet.yaml to set the default sampling rate (ROS7 does not
+  # include sampling rate in its NetFlow export):
+  #   core:
+  #     default-sampling-rate: 1
+  # ---------------------------------------------------------------------------
+  akvorado-outlet:
+    extends:
+      file: versions.yml
+      service: akvorado
+    ports:
+      - 10179:10179/tcp
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      akvorado-orchestrator:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: outlet http://akvorado-orchestrator:8080
+    volumes:
+      - akvorado-run:/run/akvorado
+    environment:
+      AKVORADO_CFG_OUTLET_METADATA_CACHEPERSISTFILE: /run/akvorado/metadata.cache
+      AKVORADO_CFG_OUTLET_FLOW_STATEPERSISTFILE: /run/akvorado/flow.state
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.akvorado-outlet-metrics.rule=PathPrefix(`/api/v0/outlet/metrics`)
+      - traefik.http.routers.akvorado-outlet-metrics.service=akvorado-outlet
+      - traefik.http.routers.akvorado-outlet-metrics.observability.accesslogs=false
+      - traefik.http.routers.akvorado-outlet.entrypoints=private
+      - traefik.http.routers.akvorado-outlet.rule=PathPrefix(`/api/v0/outlet`)
+      - traefik.http.services.akvorado-outlet.loadbalancer.server.port=8080
+      - metrics.enable=true
+      - metrics.port=8080
+      - metrics.path=/api/v0/metrics
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — columnar database for flow storage
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    extends:
+      file: versions.yml
+      service: clickhouse
+    volumes:
+      - akvorado-clickhouse:/var/lib/clickhouse
+      - ./clickhouse/observability.xml:/etc/clickhouse-server/config.d/observability.xml
+      - ./clickhouse/server.xml:/etc/clickhouse-server/config.d/akvorado.xml
+    environment:
+      CLICKHOUSE_INIT_TIMEOUT: 60
+      CLICKHOUSE_SKIP_USER_SETUP: 1
+    cap_add:
+      - SYS_NICE
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      interval: 20s
+      test: ["CMD", "wget", "-T", "1", "--spider", "--no-proxy", "http://127.0.0.1:8123/ping"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.clickhouse.entrypoints=private
+      - traefik.http.routers.clickhouse.rule=PathPrefix(`/clickhouse`)
+      - traefik.http.routers.clickhouse.middlewares=clickhouse-strip
+      - traefik.http.middlewares.clickhouse-strip.stripprefix.prefixes=/clickhouse
+      - metrics.enable=true
+      - metrics.port=8123
+
+  # ---------------------------------------------------------------------------
+  # Traefik — reverse proxy, TLS termination, and basic auth
+  #
+  # Entrypoints:
+  #   private  :8080 — internal services only, bound to loopback (127.0.0.1)
+  #   public   :8081 — HTTP, redirects all traffic to HTTPS
+  #   websecure:8443 — HTTPS with basic auth, mapped to external port 443
+  #
+  # TO SET UP BASIC AUTH:
+  #   1. Run: htpasswd -nbB flows yourpassword
+  #   2. Escape every $ as $$ in the output
+  #   3. Paste the result into the basic-auth label below
+  # ---------------------------------------------------------------------------
+  traefik:
+    extends:
+      file: versions.yml
+      service: traefik
+    restart: unless-stopped
+    environment:
+      TRAEFIK_API: "true"
+      TRAEFIK_API_BASEPATH: "/traefik"
+      TRAEFIK_METRICS_PROMETHEUS: "true"
+      TRAEFIK_METRICS_PROMETHEUS_MANUALROUTING: "true"
+      TRAEFIK_METRICS_PROMETHEUS_ADDROUTERSLABELS: "true"
+      TRAEFIK_PROVIDERS_DOCKER: "true"
+      TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT: "false"
+      # Private entrypoint — loopback only, no auth, used for internal API access
+      TRAEFIK_ENTRYPOINTS_private_ADDRESS: ":8080"
+      TRAEFIK_ENTRYPOINTS_private_HTTP_MIDDLEWARES: compress@docker
+      # Public HTTP entrypoint — redirects all traffic to HTTPS
+      TRAEFIK_ENTRYPOINTS_public_ADDRESS: ":8081"
+      TRAEFIK_ENTRYPOINTS_public_HTTP_MIDDLEWARES: ""
+      TRAEFIK_ENTRYPOINTS_public_HTTP_REDIRECTIONS_ENTRYPOINT_TO: websecure
+      TRAEFIK_ENTRYPOINTS_public_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME: https
+      # Public HTTPS entrypoint — basic auth applied to all routes here
+      TRAEFIK_ENTRYPOINTS_websecure_ADDRESS: ":8443"
+      TRAEFIK_ENTRYPOINTS_websecure_HTTP_MIDDLEWARES: compress@docker,basic-auth@docker
+      # Let's Encrypt ACME — uses HTTP challenge on the public entrypoint
+      TRAEFIK_CERTIFICATESRESOLVERS_letsencrypt_ACME_EMAIL: "email@example.com"   # <-- YOUR EMAIL
+      TRAEFIK_CERTIFICATESRESOLVERS_letsencrypt_ACME_STORAGE: "/letsencrypt/acme.json"
+      TRAEFIK_CERTIFICATESRESOLVERS_letsencrypt_ACME_HTTPCHALLENGE_ENTRYPOINT: "public"
+      TRAEFIK_ACCESSLOG: "true"
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.traefik.rule=PathPrefix(`/traefik`) && !PathPrefix(`/traefik/debug`)"
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik-metrics.rule=PathPrefix(`/traefik/metrics`)
+      - traefik.http.routers.traefik-metrics.priority=200
+      - traefik.http.routers.traefik-metrics.service=prometheus@internal
+      # --- Basic auth middleware ---
+      # Replace the hash below with your own escaped htpasswd output.
+      # Remember: every $ must be doubled to $$ in this file.
+      # Example: flows:$2y$05$abc... → flows:$$2y$$05$$abc...
+      - "traefik.http.middlewares.basic-auth.basicauth.users=flows:$$2y$$05$$w4SszuXHpQXnQWPdvATGB.M3hDihQ7jwZmk0lcE.d81eanvqmvLXu"
+      - traefik.http.middlewares.compress.compress=true
+      - "traefik.http.middlewares.compress.compress.includedcontenttypes=\
+        application/javascript,\
+        application/json,\
+        application/xml,\
+        image/svg+xml,\
+        text/css,\
+        text/csv,\
+        text/javascript,\
+        text/markdown,\
+        text/plain,\
+        text/xml"
+      - metrics.enable=true
+      - metrics.port=8080
+      - metrics.path=/traefik/metrics
+    expose:
+      - 8080/tcp
+    ports:
+      # 8080 is private — bound to loopback only, never expose externally
+      - 127.0.0.1:8080:8080/tcp
+      # 8081 is the public HTTP entrypoint — redirects to HTTPS
+      - 8081:8081/tcp
+      # Standard ports — 80 for ACME challenge and redirect, 443 for HTTPS
+      - 80:8081/tcp
+      - 443:8443/tcp
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - akvorado-letsencrypt:/letsencrypt
+
